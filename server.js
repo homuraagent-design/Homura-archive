@@ -675,6 +675,33 @@ app.use((error, req, res, next) => {
   return res.status(500).json({ error: "Internal server error." });
 });
 
+app.get("/test-shopify", async (req, res) => {
+  try {
+    checkEnvironment();
+
+    const data = await shopifyGraphQL(`
+      query {
+        shop {
+          name
+          myshopifyDomain
+          currencyCode
+        }
+      }
+    `);
+
+    res.json({
+      status: "success",
+      shop: data.shop
+    });
+  } catch (error) {
+    console.error("Shopify test:", error.message);
+    res.status(500).json({
+      status: "failed",
+      error: error.message
+    });
+  }
+});
+
 module.exports = app;
 
 // Local development only. Vercel imports the Express app above.
