@@ -5,29 +5,39 @@ const crypto = require("crypto");
 
 const app = express();
 
-const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
-const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
+const SHOPIFY_STORE_DOMAIN = (process.env.SHOPIFY_STORE_DOMAIN || "")
+  .replace(/^https?:\/\//, "")
+  .replace(/\/+$/, "");
+
+const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
+const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2026-10";
 
 const SIKKPAY_KEY = process.env.SIKKPAY_KEY;
 const SIKKPAY_SECRET = process.env.SIKKPAY_SECRET;
 const SIKKPAY_WEBHOOK_SECRET = process.env.SIKKPAY_WEBHOOK_SECRET;
-const SIKKPAY_BASE_URL =
-  (process.env.SIKKPAY_BASE_URL ||
-    "https://sikkpay.org/api/sikkpay/v1").replace(/\/+$/, "");
+const SIKKPAY_BASE_URL = (
+  process.env.SIKKPAY_BASE_URL ||
+  "https://sikkpay.org/api/sikkpay/v1"
+).replace(/\/+$/, "");
 
 const FRONTEND_ORIGINS = (
   process.env.FRONTEND_ORIGINS ||
   "https://shophomura.com,https://www.shophomura.com"
 )
   .split(",")
-  .map((origin) => origin.trim())
+  .map((x) => x.trim())
   .filter(Boolean);
+
+let cachedShopifyToken = null;
+let tokenExpiresAt = 0;
+let tokenRequestPromise = null;
 
 function checkEnvironment() {
   const required = [
     "SHOPIFY_STORE_DOMAIN",
-    "SHOPIFY_ADMIN_TOKEN",
+    "SHOPIFY_CLIENT_ID",
+    "SHOPIFY_CLIENT_SECRET",
     "SIKKPAY_KEY",
     "SIKKPAY_SECRET",
     "SIKKPAY_WEBHOOK_SECRET",
@@ -66,27 +76,93 @@ async function requestJson(url, options = {}) {
       data?.message ||
       `HTTP ${response.status}`;
 
-    throw new Error(
-      `${response.status}: ${JSON.stringify(detail)}`
-    );
+    throw new Error(`${response.status}: ${JSON.stringify(detail)}`);
   }
 
   return data;
 }
 
-async function shopifyRequest(path, options = {}) {
-  const base =
-    `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}`;
+// Shopify Client Credentials grant.
+// Tokens last 24 hours; refresh five minutes before expiry.
+async function getShopifyAccessToken() {
+  if (cachedShopifyToken && Date.now() < tokenExpiresAt - 300000) {
+    return cachedShopifyToken;
+  }
 
-  return requestJson(`${base}${path}`, {
-    ...options,
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/json",
-      "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
-      ...(options.headers || {}),
-    },
-  });
+  if (tokenRequestPromise) {
+    return tokenRequestPromise;
+  }
+
+  tokenRequestPromise = (async () => {
+    const body = new URLSearchParams({
+      grant_type: "client_credentials",
+      client_id: SHOPIFY_CLIENT_ID,
+      client_secret: SHOPIFY_CLIENT_SECRET,
+    });
+
+    const data = await requestJson(
+      `https://${SHOPIFY_STORE_DOMAIN}/admin/oauth/access_token`,
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: body.toString(),
+      }
+    );
+
+    if (!data.access_token) {
+      throw new Error("Shopify did not return an access token.");
+    }
+
+    const scopes = String(data.scope || "").split(",").map((x) => x.trim());
+
+    if (
+      !scopes.includes("read_draft_orders") ||
+      !scopes.includes("write_draft_orders")
+    ) {
+      throw new Error(
+        `Shopify token is missing required draft-order scopes. Granted: ${data.scope || "none"}`
+      );
+    }
+
+    cachedShopifyToken = data.access_token;
+    tokenExpiresAt = Date.now() + Number(data.expires_in || 86399) * 1000;
+
+    return cachedShopifyToken;
+  })();
+
+  try {
+    return await tokenRequestPromise;
+  } finally {
+    tokenRequestPromise = null;
+  }
+}
+
+async function shopifyGraphQL(query, variables = {}) {
+  const token = await getShopifyAccessToken();
+
+  const data = await requestJson(
+    `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
+    {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": token,
+      },
+      body: JSON.stringify({ query, variables }),
+    }
+  );
+
+  if (data.errors?.length) {
+    throw new Error(
+      `Shopify GraphQL error: ${JSON.stringify(data.errors)}`
+    );
+  }
+
+  return data.data;
 }
 
 async function sikkpayRequest(path, options = {}) {
@@ -102,20 +178,36 @@ async function sikkpayRequest(path, options = {}) {
   });
 }
 
+function getPaymentObject(data) {
+  return data?.payment || data?.data?.payment || data?.data || data;
+}
+
 async function getDraftOrder(orderId) {
-  const data = await shopifyRequest(
-    `/draft_orders/${encodeURIComponent(orderId)}.json`
+  const gid = `gid://shopify/DraftOrder/${orderId}`;
+
+  const data = await shopifyGraphQL(
+    `query GetDraftOrder($id: ID!) {
+      draftOrder(id: $id) {
+        id
+        legacyResourceId
+        name
+        status
+        totalPriceSet {
+          shopMoney {
+            amount
+            currencyCode
+          }
+        }
+      }
+    }`,
+    { id: gid }
   );
 
-  if (!data.draft_order) {
+  if (!data?.draftOrder) {
     throw new Error("Shopify draft order was not found.");
   }
 
-  return data.draft_order;
-}
-
-function getPaymentObject(data) {
-  return data?.payment || data?.data?.payment || data?.data || data;
+  return data.draftOrder;
 }
 
 async function getSikkpayPayment(orderId) {
@@ -127,26 +219,45 @@ async function getSikkpayPayment(orderId) {
 }
 
 async function completeDraftOrder(orderId) {
-  const existing = await getDraftOrder(orderId);
+  const draft = await getDraftOrder(orderId);
 
-  // Avoid completing the same draft order twice.
-  if (existing.status === "completed") {
-    return existing;
+  if (String(draft.status).toUpperCase() === "COMPLETED") {
+    return draft;
   }
 
-  const data = await shopifyRequest(
-    `/draft_orders/${encodeURIComponent(orderId)}/complete.json?payment_pending=false`,
-    {
-      method: "PUT",
-      body: JSON.stringify({}),
-    }
+  const data = await shopifyGraphQL(
+    `mutation CompleteDraftOrder($id: ID!) {
+      draftOrderComplete(id: $id, paymentPending: false) {
+        draftOrder {
+          id
+          name
+          status
+          order {
+            name
+          }
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }`,
+    { id: draft.id }
   );
 
-  if (!data.draft_order) {
-    throw new Error("Shopify did not return the completed order.");
+  const result = data?.draftOrderComplete;
+
+  if (result?.userErrors?.length) {
+    throw new Error(
+      `Shopify completion error: ${JSON.stringify(result.userErrors)}`
+    );
   }
 
-  return data.draft_order;
+  if (!result?.draftOrder) {
+    throw new Error("Shopify did not complete the draft order.");
+  }
+
+  return result.draftOrder;
 }
 
 async function confirmAndComplete(orderId) {
@@ -154,7 +265,7 @@ async function confirmAndComplete(orderId) {
     throw new Error("Invalid order ID.");
   }
 
-  // Always check Sikkpay directly. Never trust the return URL alone.
+  // Never trust the customer's return URL as proof of payment.
   const payment = await getSikkpayPayment(orderId);
 
   if (String(payment?.status || "").toLowerCase() !== "paid") {
@@ -169,12 +280,13 @@ async function confirmAndComplete(orderId) {
   }
 
   const draft = await getDraftOrder(orderId);
+  const money = draft.totalPriceSet?.shopMoney;
 
-  if (String(draft.currency || "").toUpperCase() !== "PKR") {
-    throw new Error("Shopify order currency must be PKR.");
+  if (String(money?.currencyCode || "").toUpperCase() !== "PKR") {
+    throw new Error("Shopify store currency must be PKR.");
   }
 
-  const total = Number(draft.total_price);
+  const total = Number(money.amount);
   const expectedAmount = Math.round(total);
 
   if (
@@ -190,6 +302,8 @@ async function confirmAndComplete(orderId) {
     if (Number(payment.amount) !== expectedAmount) {
       throw new Error("Sikkpay payment amount does not match the order.");
     }
+  } else {
+    throw new Error("Sikkpay did not provide a verifiable payment amount.");
   }
 
   if (
@@ -204,7 +318,7 @@ async function confirmAndComplete(orderId) {
   return {
     status: "paid",
     orderId: String(orderId),
-    orderNumber: completed.name || null,
+    orderName: completed.order?.name || completed.name || null,
   };
 }
 
@@ -222,18 +336,14 @@ function verifySikkpaySignature(signatureHeader, rawBody) {
     .filter((part) => part[0] === "v1")
     .map((part) => part[1]);
 
-  if (!timestamp || !signatures.length) {
-    return false;
-  }
+  if (!timestamp || !signatures.length) return false;
 
   const timestampNumber = Number(timestamp);
 
-  if (!Number.isFinite(timestampNumber)) {
-    return false;
-  }
-
-  // Reject webhook signatures older than five minutes.
-  if (Math.abs(Date.now() / 1000 - timestampNumber) > 300) {
+  if (
+    !Number.isFinite(timestampNumber) ||
+    Math.abs(Date.now() / 1000 - timestampNumber) > 300
+  ) {
     return false;
   }
 
@@ -258,7 +368,7 @@ function verifySikkpaySignature(signatureHeader, rawBody) {
   });
 }
 
-// CORS: allow your storefront, not arbitrary websites.
+// CORS for the HOMURA storefront.
 app.use(
   cors({
     origin(origin, callback) {
@@ -272,7 +382,7 @@ app.use(
   })
 );
 
-// IMPORTANT: webhook must receive the original, unparsed request body.
+// Webhook must receive the original, unparsed body.
 app.post(
   "/sikkpay/webhook",
   express.raw({ type: "application/json" }),
@@ -282,16 +392,18 @@ app.post(
         return res.sendStatus(400);
       }
 
-      const signature = req.get("Sikkpay-Signature");
-
-      if (!verifySikkpaySignature(signature, req.body)) {
+      if (
+        !verifySikkpaySignature(
+          req.get("Sikkpay-Signature"),
+          req.body
+        )
+      ) {
         return res.sendStatus(401);
       }
 
       const event = JSON.parse(req.body.toString("utf8"));
       const eventType = event.event || event.type;
 
-      // Ignore other event types.
       if (eventType !== "payment.paid") {
         return res.sendStatus(200);
       }
@@ -308,7 +420,6 @@ app.post(
         return res.sendStatus(400);
       }
 
-      // Re-check payment through Sikkpay's authenticated API.
       const result = await confirmAndComplete(orderId);
 
       if (result.status !== "paid") {
@@ -326,10 +437,13 @@ app.post(
 app.use(express.json({ limit: "100kb" }));
 
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", service: "HOMURA payment backend" });
+  res.json({
+    status: "ok",
+    service: "HOMURA payment backend",
+  });
 });
 
-// Create Shopify draft order, then create Sikkpay payment.
+// Create a Shopify draft order, then create its Sikkpay payment.
 app.post("/create-payment", async (req, res) => {
   try {
     checkEnvironment();
@@ -367,17 +481,17 @@ app.post("/create-payment", async (req, res) => {
         throw new Error("A cart item is invalid.");
       }
 
-      const properties = Object.entries(item.properties || {})
+      const customAttributes = Object.entries(item.properties || {})
         .slice(0, 20)
         .map(([key, value]) => ({
-          name: String(key).slice(0, 255),
+          key: String(key).slice(0, 255),
           value: String(value).slice(0, 255),
         }));
 
       return {
-        variant_id: Number(variantId),
+        variantId: `gid://shopify/ProductVariant/${variantId}`,
         quantity,
-        ...(properties.length ? { properties } : {}),
+        ...(customAttributes.length ? { customAttributes } : {}),
       };
     });
 
@@ -393,46 +507,78 @@ app.post("/create-payment", async (req, res) => {
       return sendError(res, "Shipping configuration is invalid.", 500);
     }
 
-    const draftOrder = {
-      line_items: lineItems,
+    const draftInput = {
+      lineItems,
       email: email.trim(),
+      phone: phone.trim(),
       note: `HOMURA custom checkout. Customer phone: ${phone.trim()}`,
-      shipping_address: {
-        first_name: firstName,
-        last_name: lastName,
+      shippingAddress: {
+        firstName,
+        lastName,
         address1: address.trim(),
         city: city.trim(),
-        country_code: "PK",
+        countryCode: "PK",
         phone: phone.trim(),
       },
+      presentmentCurrencyCode: "PKR",
       ...(shippingAmount > 0
         ? {
-            shipping_line: {
+            shippingLine: {
               title: "Shipping",
-              price: shippingAmount.toFixed(2),
+              priceWithCurrency: {
+                amount: shippingAmount.toFixed(2),
+                currencyCode: "PKR",
+              },
             },
           }
         : {}),
     };
 
-    const created = await shopifyRequest("/draft_orders.json", {
-      method: "POST",
-      body: JSON.stringify({ draft_order: draftOrder }),
-    });
+    const created = await shopifyGraphQL(
+      `mutation CreateDraftOrder($input: DraftOrderInput!) {
+        draftOrderCreate(input: $input) {
+          draftOrder {
+            id
+            legacyResourceId
+            name
+            status
+            totalPriceSet {
+              shopMoney {
+                amount
+                currencyCode
+              }
+            }
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }`,
+      { input: draftInput }
+    );
 
-    const draft = created.draft_order;
+    const result = created?.draftOrderCreate;
 
-    if (!draft?.id) {
-      throw new Error("Shopify did not create the draft order.");
-    }
-
-    if (String(draft.currency || "").toUpperCase() !== "PKR") {
+    if (result?.userErrors?.length) {
       throw new Error(
-        "Your Shopify store currency must be PKR for this Sikkpay integration."
+        `Shopify draft-order error: ${JSON.stringify(result.userErrors)}`
       );
     }
 
-    const total = Number(draft.total_price);
+    const draft = result?.draftOrder;
+
+    if (!draft?.legacyResourceId) {
+      throw new Error("Shopify did not create the draft order.");
+    }
+
+    const money = draft.totalPriceSet?.shopMoney;
+
+    if (String(money?.currencyCode || "").toUpperCase() !== "PKR") {
+      throw new Error("Your Shopify store currency must be PKR.");
+    }
+
+    const total = Number(money.amount);
     const amount = Math.round(total);
 
     if (
@@ -446,18 +592,20 @@ app.post("/create-payment", async (req, res) => {
       );
     }
 
+    const orderId = String(draft.legacyResourceId);
+
     const returnUrl = new URL(
       process.env.SIKKPAY_RETURN_URL || "https://shophomura.com/"
     );
 
-    returnUrl.searchParams.set("homura_order_id", String(draft.id));
+    returnUrl.searchParams.set("homura_order_id", orderId);
 
     const paymentResponse = await sikkpayRequest("/payments", {
       method: "POST",
       body: JSON.stringify({
         amount,
-        order_id: String(draft.id),
-        description: `HOMURA Order ${draft.name || draft.id}`,
+        order_id: orderId,
+        description: `HOMURA Order ${draft.name || orderId}`,
         return_url: returnUrl.toString(),
       }),
     });
@@ -482,7 +630,7 @@ app.post("/create-payment", async (req, res) => {
     }
 
     return res.status(201).json({
-      orderId: String(draft.id),
+      orderId,
       orderName: draft.name || null,
       amount,
       currency: "PKR",
@@ -498,7 +646,7 @@ app.post("/create-payment", async (req, res) => {
   }
 });
 
-// Check Sikkpay status. A paid response also completes the Shopify draft order.
+// Verify payment status and complete the draft order only after payment.
 app.get("/check-status/:orderId", async (req, res) => {
   try {
     checkEnvironment();
@@ -510,7 +658,6 @@ app.get("/check-status/:orderId", async (req, res) => {
     }
 
     const result = await confirmAndComplete(orderId);
-
     return res.json(result);
   } catch (error) {
     console.error("Payment status error:", error.message);
