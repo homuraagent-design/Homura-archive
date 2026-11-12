@@ -84,6 +84,7 @@ async function requestJson(url, options = {}) {
 
 // Shopify Client Credentials grant.
 // Tokens last 24 hours; refresh five minutes before expiry.
+
 async function getShopifyAccessToken() {
   if (cachedShopifyToken && Date.now() < tokenExpiresAt - 300000) {
     return cachedShopifyToken;
@@ -116,14 +117,14 @@ async function getShopifyAccessToken() {
       throw new Error("Shopify did not return an access token.");
     }
 
-    const scopes = String(data.scope || "").split(",").map((x) => x.trim());
+    const scopes = String(data.scope || "")
+      .split(/[,\s]+/)
+      .map((x) => x.trim())
+      .filter(Boolean);
 
-    if (
-      !scopes.includes("read_draft_orders") ||
-      !scopes.includes("write_draft_orders")
-    ) {
+    if (!scopes.includes("write_draft_orders")) {
       throw new Error(
-        `Shopify token is missing required draft-order scopes. Granted: ${data.scope || "none"}`
+        `Shopify token is missing write_draft_orders. Granted: ${data.scope || "none"}`
       );
     }
 
@@ -139,6 +140,7 @@ async function getShopifyAccessToken() {
     tokenRequestPromise = null;
   }
 }
+
 
 async function shopifyGraphQL(query, variables = {}) {
   const token = await getShopifyAccessToken();
